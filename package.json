@@ -1,0 +1,32 @@
+{
+  "name": "localscore-server",
+  "version": "1.0.0",
+  "description": "LocalScore - Live cricket match scoring platform. Built by JV (Javvaji Venkateswarlu)",
+  "author": "JV",
+  "copyright": "Copyright © 2026 JV. All rights reserved.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "jest --forceExit --detectOpenHandles"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongoose": "^7.6.3",
+    "socket.io": "^4.7.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "nanoid": "^3.3.7",
+    "express-rate-limit": "^7.1.4",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/src/__tests__/**/*.test.js"]
+  }
+}
