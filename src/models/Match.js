@@ -125,15 +125,11 @@ const matchSchema = new mongoose.Schema({
     type: inningsSubSchema,
     default: () => ({}),
   },
-  // Super Over support
-  superOver1: {
+  // Super Over support (array to allow multiple Super Overs)
+  superOvers: [{
     type: inningsSubSchema,
-    default: null,
-  },
-  superOver2: {
-    type: inningsSubSchema,
-    default: null,
-  },
+    default: () => ({}),
+  }],
   hasSuperOver: {
     type: Boolean,
     default: false,

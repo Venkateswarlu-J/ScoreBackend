@@ -535,8 +535,9 @@ router.post('/:matchId/deliveries', mutationLimiter, authMiddleware, async (req,
       return res.status(401).json({ error: 'Invalid scorer token' });
     }
 
-    if (match.status !== 'LIVE') {
-      return res.status(400).json({ error: 'Match is not in LIVE state' });
+    // Allow scoring in LIVE or SUPER_OVER state
+    if (match.status !== 'LIVE' && match.status !== 'SUPER_OVER') {
+      return res.status(400).json({ error: 'Match is not in a scorable state' });
     }
 
     const deliveryData = req.body;
@@ -548,7 +549,43 @@ router.post('/:matchId/deliveries', mutationLimiter, authMiddleware, async (req,
       return res.status(409).json({ error: 'Delivery with this idempotency key already exists' });
     }
 
-    const currentInnings = match.currentInnings === 1 ? match.innings1 : match.innings2;
+    // Determine current innings object based on match status and currentInnings
+    let currentInnings;
+    let inningsNumber;
+    let maxWickets = 2; // Super Over has 2 wickets per team by default
+    let oversLimit = 6; // Super Over is 6 balls (1 over)
+
+    if (match.status === 'SUPER_OVER') {
+      // For Super Over, use the superOvers array (currentInnings is 1-indexed)
+      const soIndex = match.currentInnings - 1;
+      if (match.superOvers && match.superOvers.length > soIndex) {
+        currentInnings = match.superOvers[soIndex];
+      } else if (match.currentInnings === 1 && match.superOver1) {
+        // Backward compatibility
+        currentInnings = match.superOver1;
+      } else if (match.currentInnings === 2 && match.superOver2) {
+        // Backward compatibility
+        currentInnings = match.superOver2;
+      }
+      inningsNumber = match.currentInnings;
+      // Super Over: 1 over (6 balls), 2 wickets
+      oversLimit = 6;
+      maxWickets = 2;
+    } else {
+      // Regular match innings
+      currentInnings = match.currentInnings === 1 ? match.innings1 : match.innings2;
+      inningsNumber = match.currentInnings;
+      // Regular innings: use match.oversPerInnings and team size
+      oversLimit = match.oversPerInnings > 0 ? match.oversPerInnings * 6 : Infinity;
+      const battingTeamSize = match.currentInnings === 1
+        ? (match.team1?.players?.length || 11)
+        : (match.team2?.players?.length || 11);
+      maxWickets = battingTeamSize - 1;
+    }
+
+    if (!currentInnings) {
+      return res.status(400).json({ error: 'Current innings not initialized' });
+    }
 
     // Require all three player IDs
     const strikerId = deliveryData.strikerId || currentInnings.activeStrikerId;
@@ -563,7 +600,7 @@ router.post('/:matchId/deliveries', mutationLimiter, authMiddleware, async (req,
 
     const inningsSequence = (await DeliveryEvent.countDocuments({
       matchId: match._id,
-      inningsNumber: match.currentInnings,
+      inningsNumber,
     })) + 1;
 
     const isLegalDelivery = deliveryData.isLegalDelivery !== undefined
@@ -573,7 +610,7 @@ router.post('/:matchId/deliveries', mutationLimiter, authMiddleware, async (req,
     // Create and save delivery event
     const deliveryEvent = new DeliveryEvent({
       matchId: match._id,
-      inningsNumber: match.currentInnings,
+      inningsNumber,
       sequence: inningsSequence,
       strikerId,
       nonStrikerId,
@@ -589,33 +626,40 @@ router.post('/:matchId/deliveries', mutationLimiter, authMiddleware, async (req,
 
     await deliveryEvent.save();
 
-    // Apply to innings state
-    scoringEngine.applyDelivery(currentInnings, deliveryEvent, match.oversPerInnings);
+    // Apply to innings state - use oversPerInnings for regular match, 1 for Super Over (6 balls)
+    const oversForScoring = match.status === 'SUPER_OVER' ? 1 : match.oversPerInnings;
+    scoringEngine.applyDelivery(currentInnings, deliveryEvent, oversForScoring);
 
     // ── Innings completion checks ───────────────────────────────────────────
-    // Check if innings is complete (overs exhausted OR all wickets lost OR target reached)
     let inningsJustCompleted = false;
 
-    // Get team size for all-out detection (default to 11 players if not set)
-    const battingTeamSize = match.currentInnings === 1
-      ? (match.team1?.players?.length || 11)
-      : (match.team2?.players?.length || 11);
-    const maxWickets = battingTeamSize - 1; // All out when n-1 wickets fall
-
-    // 1. Overs exhausted
-    if (match.oversPerInnings > 0 && currentInnings.legalBalls >= match.oversPerInnings * 6) {
+    // 1. Overs exhausted (for Super Over: 6 balls; for regular: match.oversPerInnings)
+    if (oversLimit !== Infinity && currentInnings.legalBalls >= oversLimit) {
       currentInnings.status = 'COMPLETED';
       inningsJustCompleted = true;
     }
 
-    // 2. All wickets lost (team_size - 1 wickets, or default 10)
+    // 2. All wickets lost (2 for Super Over, team_size - 1 for regular)
     if (currentInnings.wickets >= maxWickets) {
       currentInnings.status = 'COMPLETED';
       inningsJustCompleted = true;
     }
 
-    // 3. Target reached (innings 2 only)
-    if (match.currentInnings === 2 && currentInnings.target != null && currentInnings.total >= currentInnings.target) {
+    // 3. Target reached (Super Over 2 or regular innings 2)
+    if (match.status === 'SUPER_OVER' && match.currentInnings === 2 && currentInnings.target != null && currentInnings.total >= currentInnings.target) {
+      currentInnings.status = 'COMPLETED';
+      inningsJustCompleted = true;
+      // Winner determined in Super Over 2
+      match.status = 'COMPLETED';
+      const winnerTeam = match.superOver2?.battingTeamName || match.innings2?.battingTeamName || match.team2?.teamName;
+      const wktsRemaining = maxWickets - (match.superOver2?.wickets || 0);
+      match.result = {
+        winner: winnerTeam,
+        resultText: `${winnerTeam} won by ${wktsRemaining} wicket${wktsRemaining !== 1 ? 's' : ''} in Super Over`,
+        margin: wktsRemaining,
+        marginType: 'wickets',
+      };
+    } else if (match.status === 'LIVE' && match.currentInnings === 2 && currentInnings.target != null && currentInnings.total >= currentInnings.target) {
       currentInnings.status = 'COMPLETED';
       inningsJustCompleted = true;
       // Auto-complete match when target is chased
@@ -631,40 +675,110 @@ router.post('/:matchId/deliveries', mutationLimiter, authMiddleware, async (req,
       }
     }
 
-    // 4. First innings completed - transition to INNINGS_BREAK (not auto-start innings 2)
-    if (match.currentInnings === 1 && inningsJustCompleted && match.status === 'LIVE') {
-      match.status = 'INNINGS_BREAK';
-      // Set target for second innings
-      match.innings2.target = match.innings1.total + 1;
-    }
+    if (match.status === 'SUPER_OVER') {
+      // Handle Super Over completions
+      // Find the current Super Over index (0-based)
+      const soIndex = match.currentInnings - 1;
+      const currentSO = match.superOvers && match.superOvers.length > soIndex
+        ? match.superOvers[soIndex]
+        : (match.currentInnings === 1 ? match.superOver1 : match.superOver2);
 
-    // 5. Second innings completed without chasing target - check for tie or match over
-    if (match.currentInnings === 2 && inningsJustCompleted && match.status !== 'COMPLETED') {
-      const margin = match.innings1.total - (match.innings2.total || 0);
+      if (match.currentInnings === 1 && inningsJustCompleted) {
+        // Super Over 1 (first innings of this Super Over) completed
+        // Check if there's a Super Over 2 already, or create placeholder
+        let nextSO = match.superOvers && match.superOvers.length > 1
+          ? match.superOvers[1]
+          : match.superOver2;
 
-      if (margin === 0) {
-        // Match is TIED - offer super over
-        match.status = 'TIED';
-        match.result = {
-          winner: null,
-          resultText: 'Match Tied!',
-          margin: 0,
-          marginType: null, // No margin type for a tie
-        };
-      } else {
-        // Team that batted first wins
-        match.status = 'COMPLETED';
-        match.result = {
-          winner: match.innings1.battingTeamName || match.team1.teamName,
-          resultText: `${match.innings1.battingTeamName || match.team1.teamName} won by ${margin} run${margin !== 1 ? 's' : ''}`,
-          margin,
-          marginType: 'runs',
-        };
+        if (nextSO) {
+          match.currentInnings = 2;
+          nextSO.target = currentSO.total + 1;
+          nextSO.status = 'IN_PROGRESS';
+          match.status = 'SUPER_OVER';
+        }
+      } else if (match.currentInnings > 1 && inningsJustCompleted && match.status !== 'COMPLETED') {
+        // Second innings of current Super Over completed without chasing target
+        // Check for tie or winner
+        const firstSO = match.superOvers && match.superOvers.length > 0
+          ? match.superOvers[0]
+          : match.superOver1;
+        const secondSO = match.superOvers && match.superOvers.length > 1
+          ? match.superOvers[1]
+          : match.superOver2;
+
+        const margin = (firstSO?.total || 0) - (secondSO?.total || 0);
+
+        if (margin === 0) {
+          // Super Over tied - offer another Super Over
+          match.status = 'TIED';
+          match.result = {
+            winner: null,
+            resultText: 'Super Over Tied! Another Super Over needed.',
+            margin: 0,
+            marginType: null,
+          };
+        } else {
+          // Winner in Super Over
+          match.status = 'COMPLETED';
+          const winnerTeam = margin > 0
+            ? (firstSO?.battingTeamName || match.innings2?.battingTeamName || match.team2?.teamName)
+            : (secondSO?.battingTeamName || match.innings1?.battingTeamName || match.team1?.teamName);
+          match.result = {
+            winner: winnerTeam,
+            resultText: `${winnerTeam} won by ${Math.abs(margin)} run${Math.abs(margin) !== 1 ? 's' : ''} in Super Over`,
+            margin: Math.abs(margin),
+            marginType: 'runs',
+          };
+        }
+      }
+    } else if (match.status === 'LIVE') {
+      // Handle regular match completions
+      // 4. First innings completed - transition to INNINGS_BREAK (not auto-start innings 2)
+      if (match.currentInnings === 1 && inningsJustCompleted && match.status === 'LIVE') {
+        match.status = 'INNINGS_BREAK';
+        // Set target for second innings
+        match.innings2.target = match.innings1.total + 1;
+      }
+
+      // 5. Second innings completed without chasing target - check for tie or match over
+      if (match.currentInnings === 2 && inningsJustCompleted && match.status !== 'COMPLETED') {
+        const margin = match.innings1.total - (match.innings2.total || 0);
+
+        if (margin === 0) {
+          // Match is TIED - offer super over
+          match.status = 'TIED';
+          match.result = {
+            winner: null,
+            resultText: 'Match Tied!',
+            margin: 0,
+            marginType: null, // No margin type for a tie
+          };
+        } else {
+          // Team that batted first wins
+          match.status = 'COMPLETED';
+          match.result = {
+            winner: match.innings1.battingTeamName || match.team1.teamName,
+            resultText: `${match.innings1.battingTeamName || match.team1.teamName} won by ${margin} run${margin !== 1 ? 's' : ''}`,
+            margin,
+            marginType: 'runs',
+          };
+        }
       }
     }
 
-    match.markModified('innings1');
-    match.markModified('innings2');
+    // Mark the correct innings as modified
+    if (match.status === 'SUPER_OVER') {
+      // Mark both superOvers array and individual fields for backward compatibility
+      match.markModified('superOvers');
+      if (match.currentInnings === 1) {
+        match.markModified('superOver1');
+      } else {
+        match.markModified('superOver2');
+      }
+    } else {
+      match.markModified('innings1');
+      match.markModified('innings2');
+    }
     await match.save();
 
     broadcastMatchUpdate(req, match);
@@ -692,14 +806,46 @@ router.post('/:matchId/undo', mutationLimiter, authMiddleware, async (req, res, 
       return res.status(401).json({ error: 'Invalid scorer token' });
     }
 
-    if (match.status !== 'LIVE') {
-      return res.status(400).json({ error: 'Match is not in LIVE state' });
+    // Allow undo in LIVE or SUPER_OVER state
+    if (match.status !== 'LIVE' && match.status !== 'SUPER_OVER') {
+      return res.status(400).json({ error: 'Match is not in a scorable state' });
+    }
+
+    // Determine current innings object based on match status
+    let currentInnings;
+    let inningsNumber;
+    let oversLimit;
+    let maxWickets;
+
+    if (match.status === 'SUPER_OVER') {
+      // For Super Over, use the superOvers array (currentInnings is 1-indexed)
+      const soIndex = match.currentInnings - 1;
+      if (match.superOvers && match.superOvers.length > soIndex) {
+        currentInnings = match.superOvers[soIndex];
+      } else if (match.currentInnings === 1 && match.superOver1) {
+        // Backward compatibility
+        currentInnings = match.superOver1;
+      } else if (match.currentInnings === 2 && match.superOver2) {
+        // Backward compatibility
+        currentInnings = match.superOver2;
+      }
+      inningsNumber = match.currentInnings;
+      oversLimit = 6;
+      maxWickets = 2;
+    } else {
+      currentInnings = match.currentInnings === 1 ? match.innings1 : match.innings2;
+      inningsNumber = match.currentInnings;
+      oversLimit = match.oversPerInnings > 0 ? match.oversPerInnings * 6 : Infinity;
+      const battingTeamSize = match.currentInnings === 1
+        ? (match.team1?.players?.length || 11)
+        : (match.team2?.players?.length || 11);
+      maxWickets = battingTeamSize - 1;
     }
 
     // Find most-recent delivery (for active innings)
     const lastDelivery = await DeliveryEvent.findOne({
       matchId: match._id,
-      inningsNumber: match.currentInnings,
+      inningsNumber,
     }).sort({ sequence: -1 });
 
     if (!lastDelivery) {
@@ -710,21 +856,31 @@ router.post('/:matchId/undo', mutationLimiter, authMiddleware, async (req, res, 
     await DeliveryEvent.deleteOne({ _id: lastDelivery._id });
 
     // Recalculate innings state from scratch
-    await scoringEngine.recalculateInnings(match, match.currentInnings);
+    await scoringEngine.recalculateInnings(match, inningsNumber);
 
     // If the innings was marked COMPLETED after recalc, reopen it if appropriate
-    const innings = match.currentInnings === 1 ? match.innings1 : match.innings2;
-    if (innings.status === 'COMPLETED') {
-      const oversNotDone = match.oversPerInnings === 0 || innings.legalBalls < match.oversPerInnings * 6;
-      const wicketsNotOut = innings.wickets < 10;
-      const targetNotReached = match.currentInnings === 1 || !innings.target || innings.total < innings.target;
+    if (currentInnings.status === 'COMPLETED') {
+      const oversNotDone = oversLimit === Infinity || currentInnings.legalBalls < oversLimit;
+      const wicketsNotOut = currentInnings.wickets < maxWickets;
+      const targetNotReached = (match.status === 'LIVE' && match.currentInnings === 1) ||
+        (match.status === 'LIVE' && match.currentInnings === 2 && (!currentInnings.target || currentInnings.total < currentInnings.target)) ||
+        (match.status === 'SUPER_OVER' && match.currentInnings === 2 && (!currentInnings.target || currentInnings.total < currentInnings.target));
       if (oversNotDone && wicketsNotOut && targetNotReached) {
-        innings.status = 'IN_PROGRESS';
+        currentInnings.status = 'IN_PROGRESS';
       }
     }
 
-    match.markModified('innings1');
-    match.markModified('innings2');
+    // Mark the correct innings as modified
+    if (match.status === 'SUPER_OVER') {
+      if (match.currentInnings === 1) {
+        match.markModified('superOver1');
+      } else {
+        match.markModified('superOver2');
+      }
+    } else {
+      match.markModified('innings1');
+      match.markModified('innings2');
+    }
     await match.save();
 
     broadcastMatchUpdate(req, match);
@@ -750,7 +906,25 @@ router.post('/:matchId/select-batter', mutationLimiter, authMiddleware, async (r
     }
 
     const { playerId, displayName } = req.body;
-    const currentInnings = match.currentInnings === 1 ? match.innings1 : match.innings2;
+
+    // Determine current innings based on match status
+    let currentInnings;
+    if (match.status === 'SUPER_OVER') {
+      const soIndex = match.currentInnings - 1;
+      if (match.superOvers && match.superOvers.length > soIndex) {
+        currentInnings = match.superOvers[soIndex];
+      } else if (match.currentInnings === 1 && match.superOver1) {
+        currentInnings = match.superOver1;
+      } else if (match.currentInnings === 2 && match.superOver2) {
+        currentInnings = match.superOver2;
+      }
+    } else {
+      currentInnings = match.currentInnings === 1 ? match.innings1 : match.innings2;
+    }
+
+    if (!currentInnings) {
+      return res.status(400).json({ error: 'Current innings not initialized' });
+    }
 
     // Add new batter if not already tracked
     const existing = currentInnings.batters.find(b => b.playerId === playerId);
@@ -769,8 +943,18 @@ router.post('/:matchId/select-batter', mutationLimiter, authMiddleware, async (r
     currentInnings.activeStrikerId = playerId;
     currentInnings.needNewBatter = false;
 
-    match.markModified('innings1');
-    match.markModified('innings2');
+    // Mark the correct innings as modified
+    if (match.status === 'SUPER_OVER') {
+      match.markModified('superOvers');
+      if (match.currentInnings === 1) {
+        match.markModified('superOver1');
+      } else {
+        match.markModified('superOver2');
+      }
+    } else {
+      match.markModified('innings1');
+      match.markModified('innings2');
+    }
     await match.save();
 
     broadcastMatchUpdate(req, match);
@@ -928,7 +1112,7 @@ router.post('/:matchId/start-innings', mutationLimiter, authMiddleware, async (r
 
 /**
  * POST /api/matches/:matchId/start-super-over
- * Start super over for tied match
+ * Start super over for tied match (supports multiple Super Overs)
  */
 router.post('/:matchId/start-super-over', mutationLimiter, authMiddleware, async (req, res, next) => {
   try {
@@ -946,15 +1130,37 @@ router.post('/:matchId/start-super-over', mutationLimiter, authMiddleware, async
 
     const { openingBatters, bowler, battingTeam, bowlingTeam } = req.body;
 
+    // Initialize super overs array if not exists
+    if (!match.superOvers) {
+      match.superOvers = [];
+    }
+
+    const superOverNumber = match.superOvers.length + 1;
+    const isFirstSuperOver = superOverNumber === 1;
+
+    // Determine batting/bowling teams
+    // For first Super Over: team that batted second in main match bats first
+    // For subsequent Super Overs: alternate (team that bowled first in previous SO bats first)
+    let soBattingTeam, soBowlingTeam;
+    if (isFirstSuperOver) {
+      soBattingTeam = battingTeam || match.innings2?.battingTeamName;
+      soBowlingTeam = bowlingTeam || match.innings1?.battingTeamName;
+    } else {
+      // Alternate: previous Super Over's bowling team bats first
+      const prevSO = match.superOvers[match.superOvers.length - 1];
+      soBattingTeam = battingTeam || prevSO?.bowlingTeamName;
+      soBowlingTeam = bowlingTeam || prevSO?.battingTeamName;
+    }
+
     // Initialize super over innings
     match.hasSuperOver = true;
     match.status = 'SUPER_OVER';
     match.currentInnings = 1; // Reset to 1 for super over tracking
 
-    // Super Over 1 - team that batted second in main match bats first
-    match.superOver1 = {
-      battingTeamName: battingTeam || match.innings2.battingTeamName,
-      bowlingTeamName: bowlingTeam || match.innings1.battingTeamName,
+    // Create new Super Over innings
+    const newSuperOver = {
+      battingTeamName: soBattingTeam,
+      bowlingTeamName: soBowlingTeam,
       total: 0,
       wickets: 0,
       legalBalls: 0,
@@ -970,39 +1176,48 @@ router.post('/:matchId/start-super-over', mutationLimiter, authMiddleware, async
       const s0 = openingBatters[0];
       const s1 = openingBatters[1];
 
-      match.superOver1.activeStrikerId = s0.playerId;
-      match.superOver1.activeNonStrikerId = s1.playerId;
-      match.superOver1.batters = [
+      newSuperOver.activeStrikerId = s0.playerId;
+      newSuperOver.activeNonStrikerId = s1.playerId;
+      newSuperOver.batters = [
         { playerId: s0.playerId, displayName: s0.displayName || s0.playerId, runs: 0, ballsFaced: 0, fours: 0, sixes: 0, isOut: false },
         { playerId: s1.playerId, displayName: s1.displayName || s1.playerId, runs: 0, ballsFaced: 0, fours: 0, sixes: 0, isOut: false },
       ];
     }
 
     if (bowler) {
-      match.superOver1.activeBowlerId = bowler.playerId;
-      match.superOver1.bowlers = [
+      newSuperOver.activeBowlerId = bowler.playerId;
+      newSuperOver.bowlers = [
         { playerId: bowler.playerId, displayName: bowler.displayName || bowler.playerId, legalBallsBowled: 0, oversBowled: '0', maidens: 0, runsConceded: 0, wickets: 0, widesBowled: 0, noBallsBowled: 0 },
       ];
     }
 
-    // Super Over 2 - placeholder
-    match.superOver2 = {
-      battingTeamName: bowlingTeam || match.innings1.battingTeamName,
-      bowlingTeamName: battingTeam || match.innings2.battingTeamName,
-      total: 0,
-      wickets: 0,
-      legalBalls: 0,
-      overs: '0.0',
-      extras: { wides: 0, noBalls: 0, byes: 0, legByes: 0, penalty: 0 },
-      status: 'NOT_STARTED',
-      batters: [],
-      bowlers: [],
-      lastBallSummary: [],
-      target: null,
-    };
+    // Add to superOvers array
+    match.superOvers.push(newSuperOver);
 
-    match.markModified('superOver1');
-    match.markModified('superOver2');
+    // Also maintain backward compatibility with superOver1/superOver2 for existing code
+    if (isFirstSuperOver) {
+      match.superOver1 = newSuperOver;
+      match.superOver2 = {
+        battingTeamName: soBowlingTeam,
+        bowlingTeamName: soBattingTeam,
+        total: 0,
+        wickets: 0,
+        legalBalls: 0,
+        overs: '0.0',
+        extras: { wides: 0, noBalls: 0, byes: 0, legByes: 0, penalty: 0 },
+        status: 'NOT_STARTED',
+        batters: [],
+        bowlers: [],
+        lastBallSummary: [],
+        target: null,
+      };
+    }
+
+    match.markModified('superOvers');
+    if (isFirstSuperOver) {
+      match.markModified('superOver1');
+      match.markModified('superOver2');
+    }
     await match.save();
 
     broadcastMatchUpdate(req, match);

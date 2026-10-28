@@ -22,9 +22,28 @@ const tournamentRoutes = require('./routes/tournamentRoutes');
 
 const app = express();
 const server = http.createServer(app);
+
+// Support multiple frontend origins
+const allowedOrigins = (env.CORS_ORIGIN || '')
+  .split(',')
+  .map(origin => origin.trim().replace(/\/$/, ''))
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests without an Origin header, such as server-to-server requests
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+};
+
 const io = new SocketIOServer(server, {
   cors: {
-    origin: env.CORS_ORIGIN,
+    origin: allowedOrigins,
     credentials: true,
   },
 });
@@ -38,10 +57,7 @@ app.use(helmet());
 app.use(morgan('dev'));
 
 // CORS
-app.use(cors({
-  origin: env.CORS_ORIGIN,
-  credentials: true,
-}));
+app.use(cors(corsOptions));
 
 // Body parser
 app.use(express.json({ limit: '10kb' }));
